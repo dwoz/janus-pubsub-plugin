@@ -1,6 +1,7 @@
 #include <jansson.h>
 #include <plugins/plugin.h>
 #include <debug.h>
+#include <config.h>
 
 #define JANUS_PUBSUB_VERSION 1
 #define JANUS_PUBSUB_VERSION_STRING	"0.0.1"
@@ -55,12 +56,36 @@ static janus_plugin janus_pubsub_plugin =
 		.query_session = janus_pubsub_query_session,
 	);
 
+
+static gboolean notify_events = TRUE;
+
 janus_plugin *create(void) {
 	JANUS_LOG(LOG_VERB, "%s created!\n", JANUS_PUBSUB_NAME);
 	return &janus_pubsub_plugin;
 }
 
 int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
+	if(callback == NULL || config_path == NULL) {
+		/* Invalid arguments */
+		return -1;
+	}
+
+	/* Read configuration */
+	char filename[255];
+	g_snprintf(filename, 255, "%s/%s.cfg", config_path, JANUS_PUBSUB_PACKAGE);
+	JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
+	janus_config *config = janus_config_parse(filename);
+	if(config != NULL) {
+		janus_config_print(config);
+		janus_config_item *events = janus_config_get_item_drilldown(config, "general", "events");
+		if(events != NULL && events->value != NULL)
+			notify_events = janus_is_true(events->value);
+		if(!notify_events && callback->events_is_enabled()) {
+			JANUS_LOG(LOG_WARN, "Notification of events to handlers disabled for %s\n", JANUS_PUBSUB_NAME);
+		}
+	}
+	janus_config_destroy(config);
+	config = NULL;
 	JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_PUBSUB_NAME);
 	return 0;
 }

@@ -1,3 +1,4 @@
+#!/bin/make
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
     LIBNAME=janus_pubsub
@@ -6,7 +7,10 @@ ifeq ($(UNAME_S),Linux)
            `pkg-config --cflags glib-2.0 jansson` -D_POSIX_C_SOURCE=200112L -c -g
     LDFLAGS=`pkg-config --libs glib-2.0 jansson`
     BUILD_DIR=build
+    # XXX: These are debian specific install locations (ones where a debian
+    # package would install too). They should be generic instead.
     INSTALL_DIR=/usr/lib/x86_64-linux-gnu/janus/plugins
+    INSTALL_CONIG_DIR=/etc/janus/
     LDFLAGS=-o $(LIBOUT) $(BUILD_DIR)/$(LIBNAME).o
 endif
 ifeq ($(UNAME_S),Darwin)
@@ -15,29 +19,44 @@ ifeq ($(UNAME_S),Darwin)
     CFLAGS=-D OSX -std=c99 -fpic -I. -I/usr/local/janus/include/janus/ \
            `pkg-config --cflags glib-2.0 jansson` -D_POSIX_C_SOURCE=200112L -c -g
     INSTALL_DIR=/usr/local/janus/lib/janus/plugins/
+    INSTALL_CONIG_DIR=/usr/local/janus/etc/janus
     LDFLAGS=-dynamiclib -undefined suppress -flat_namespace \
             -o $(BUILD_DIR)/$(LIBOUTNAME)  $(BUILD_DIR)/$(LIBNAME).o
 endif
 
+
 LDFLAGS+= `pkg-config --libs glib-2.0 jansson`
 BUILD_DIR=build
+CONF_SRC=janus.plugin.pubsub.cfg.sample
+CONF_OUT=janus.plugin.pubsub.cfg
 
 
-all: $(BUILD_DIR)/$(LIBNAME).o $(BUILD_DIR)/$(LIBOUTNAME)
+all: $(BUILD_DIR)/$(LIBNAME).o $(BUILD_DIR)/$(LIBOUTNAME) $(BUILD_DIR)/$(CONF_OUT)
 
 
 $(BUILD_DIR)/$(LIBOUTNAME): $(BUILD_DIR)/$(LIBNAME).o
 	gcc -shared $(LDFLAGS)
 
+
 $(BUILD_DIR)/$(LIBNAME).o: $(BUILD_DIR)
 	gcc $(CFLAGS) $(LIBNAME).c -o $(BUILD_DIR)/$(LIBNAME).o
 
+
+$(BUILD_DIR)/$(CONF_OUT):
+	cp $(CONF_SRC) $(BUILD_DIR)/$(CONF_OUT)
+
+
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+
+
 clean:
 	rm $(BUILD_DIR)/$(LIBOUTNAME)
 	rm $(BUILD_DIR)/$(LIBNAME).o
+	rm $(BUILD_DIR)/$(CONF_OUT)
 	rm -r $(BUILD_DIR)
+
 
 install:
 	cp $(BUILD_DIR)/$(LIBOUTNAME) $(INSTALL_DIR)
+	cp $(BUILD_DIR)/$(CONF_OUT) $(INSTALL_CONF_DIR)/$(CONF_OUT)
