@@ -15,7 +15,8 @@ ifeq ($(UNAME_S),Darwin)
     CFLAGS=-D OSX -std=c99 -fpic -I. -I/usr/local/janus/include/janus/ \
            `pkg-config --cflags glib-2.0 jansson` -D_POSIX_C_SOURCE=200112L -c -g
     INSTALL_DIR=/usr/local/janus/lib/janus/plugins/
-    LDFLAGS=-dynamiclib -undefined suppress -flat_namespace -o $(BUILD_DIR)/$(LIBOUTNAME)  $(BUILD_DIR)/$(LIBNAME).o
+    LDFLAGS=-dynamiclib -undefined suppress -flat_namespace \
+            -o $(BUILD_DIR)/$(LIBOUTNAME)  $(BUILD_DIR)/$(LIBNAME).o
 endif
 
 LDFLAGS+= `pkg-config --libs glib-2.0 jansson`
