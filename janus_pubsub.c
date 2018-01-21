@@ -67,6 +67,7 @@ static janus_plugin janus_pubsub_plugin =
 static volatile gint initialized = 0, stopping = 0;
 static gboolean notify_events = TRUE;
 static GThread *handler_thread;
+static GThread *watchdog;
 
 typedef struct janus_pubsub_message {
 	janus_plugin_session *handle;
@@ -129,6 +130,44 @@ janus_plugin *create(void) {
 	return &janus_pubsub_plugin;
 }
 
+/* PubSub watchdog/garbage collector (sort of) */
+static void *janus_pubsub_watchdog(void *data) {
+	JANUS_LOG(LOG_INFO, "PubSub watchdog started\n");
+	gint64 now = 0;
+	while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
+		janus_mutex_lock(&sessions_mutex);
+		/* Iterate on all the sessions */
+		now = janus_get_monotonic_time();
+		if(old_sessions != NULL) {
+			GList *sl = old_sessions;
+			JANUS_LOG(LOG_HUGE, "Checking %d old PubSub sessions...\n", g_list_length(old_sessions));
+			while(sl) {
+				janus_pubsub_session *session = (janus_pubsub_session *)sl->data;
+				if(!session) {
+					sl = sl->next;
+					continue;
+				}
+				if(now-session->destroyed >= 5*G_USEC_PER_SEC) {
+					/* We're lazy and actually get rid of the stuff only after a few seconds */
+					JANUS_LOG(LOG_VERB, "Freeing old PubSub session\n");
+					GList *rm = sl->next;
+					old_sessions = g_list_delete_link(old_sessions, sl);
+					sl = rm;
+					session->handle = NULL;
+					g_free(session);
+					session = NULL;
+					continue;
+				}
+				sl = sl->next;
+			}
+		}
+		janus_mutex_unlock(&sessions_mutex);
+		g_usleep(500000);
+	}
+	JANUS_LOG(LOG_INFO, "PubSub watchdog stopped\n");
+	return NULL;
+}
+
 int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
 	if(callback == NULL || config_path == NULL) {
 		/* Invalid arguments */
@@ -157,10 +196,20 @@ int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
 	g_atomic_int_set(&initialized, 1);
 	messages = g_async_queue_new_full((GDestroyNotify) janus_pubsub_message_free);
 	GError *error = NULL;
+	/* Start the sessions watchdog */
+	watchdog = g_thread_try_new("pubsub watchdog", &janus_pubsub_watchdog, NULL, &error);
+	if(error != NULL) {
+		g_atomic_int_set(&initialized, 0);
+		JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the PubSub watchdog thread...\n",
+                        error->code, error->message ? error->message : "??");
+		return -1;
+	}
+        /* Start message handler thread */
 	handler_thread = g_thread_try_new("pubsub handler", janus_pubsub_handler, NULL, &error);
 	if(error != NULL) {
 		g_atomic_int_set(&initialized, 0);
-		JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the PubSub handler thread...\n", error->code, error->message ? error->message : "??");
+		JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the PubSub handler thread...\n",
+                        error->code, error->message ? error->message : "??");
 		return -1;
 	}
 	JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_PUBSUB_NAME);
@@ -176,6 +225,10 @@ void janus_pubsub_destroy(void) {
 	if(handler_thread != NULL) {
 		g_thread_join(handler_thread);
 		handler_thread = NULL;
+	}
+	if(watchdog != NULL) {
+		g_thread_join(watchdog);
+		watchdog = NULL;
 	}
 	/* FIXME Destroy the sessions cleanly */
 	janus_mutex_lock(&sessions_mutex);
@@ -224,7 +277,7 @@ static janus_pubsub_session *janus_pubsub_lookup_session(janus_plugin_session *h
 }
 
 void janus_pubsub_create_session(janus_plugin_session *handle, int *error) {
-        if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
+	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
 	  *error = -1;
 	  return;
 	}
@@ -257,7 +310,7 @@ void janus_pubsub_destroy_session(janus_plugin_session *handle, int *error) {
 		*error = -2;
 		return;
 	}
-	JANUS_LOG(LOG_VERB, "Removing Echo Test session...\n");
+	JANUS_LOG(LOG_VERB, "Removing PubSub session...\n");
 	janus_mutex_lock(&sessions_mutex);
 	if(!session->destroyed) {
 		session->destroyed = janus_get_monotonic_time();
@@ -510,6 +563,6 @@ error:
 		}
 	}
 	//g_free(error_cause);
-	JANUS_LOG(LOG_VERB, "Leaving EchoTest handler thread\n");
+	JANUS_LOG(LOG_VERB, "Leaving PubSub handler thread\n");
 	return NULL;
 }
