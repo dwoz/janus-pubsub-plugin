@@ -36,6 +36,7 @@ void janus_pubsub_incoming_data(janus_plugin_session *handle, char *buf, int len
 void janus_pubsub_slow_link(janus_plugin_session *handle, int uplink, int video);
 void janus_pubsub_hangup_media(janus_plugin_session *handle);
 void janus_pubsub_destroy_session(janus_plugin_session *handle, int *error);
+static void *janus_pubsub_handler(void *data);
 json_t *janus_pubsub_query_session(janus_plugin_session *handle);
 
 static janus_plugin janus_pubsub_plugin =
@@ -65,6 +66,17 @@ static janus_plugin janus_pubsub_plugin =
 
 static volatile gint initialized = 0, stopping = 0;
 static gboolean notify_events = TRUE;
+static GThread *handler_thread;
+
+typedef struct janus_pubsub_message {
+	janus_plugin_session *handle;
+	char *transaction;
+	json_t *message;
+	json_t *jsep;
+} janus_pubsub_message;
+static GAsyncQueue *messages = NULL;
+static janus_pubsub_message exit_message;
+
 typedef struct janus_pubsub_session {
 	janus_plugin_session *handle;
 	gboolean has_audio;
@@ -81,9 +93,36 @@ typedef struct janus_pubsub_session {
 	volatile gint hangingup;
 	gint64 destroyed;	/* Time at which this session was marked as destroyed */
 } janus_pubsub_session;
+
+
 static GHashTable *sessions;
 static GList *old_sessions;
 static janus_mutex sessions_mutex;
+static janus_callbacks *gateway = NULL;
+
+/* Error codes */
+#define JANUS_PUBSUB_ERROR_NO_MESSAGE			411
+#define JANUS_PUBSUB_ERROR_INVALID_JSON		412
+#define JANUS_PUBSUB_ERROR_INVALID_ELEMENT	413
+#define JANUS_PUBSUB_ERROR_INVALID_SDP		414
+
+static void janus_pubsub_message_free(janus_pubsub_message *msg) {
+	if(!msg || msg == &exit_message)
+		return;
+
+	msg->handle = NULL;
+
+	g_free(msg->transaction);
+	msg->transaction = NULL;
+	if(msg->message)
+		json_decref(msg->message);
+	msg->message = NULL;
+	if(msg->jsep)
+		json_decref(msg->jsep);
+	msg->jsep = NULL;
+
+	g_free(msg);
+}
 
 janus_plugin *create(void) {
 	JANUS_LOG(LOG_VERB, "%s created!\n", JANUS_PUBSUB_NAME);
@@ -112,9 +151,18 @@ int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
 	}
 	janus_config_destroy(config);
 	config = NULL;
-        sessions = g_hash_table_new(NULL, NULL);
+	gateway = callback;
+	sessions = g_hash_table_new(NULL, NULL);
 	janus_mutex_init(&sessions_mutex);
-        g_atomic_int_set(&initialized, 1);
+	g_atomic_int_set(&initialized, 1);
+	messages = g_async_queue_new_full((GDestroyNotify) janus_pubsub_message_free);
+	GError *error = NULL;
+	handler_thread = g_thread_try_new("pubsub handler", janus_pubsub_handler, NULL, &error);
+	if(error != NULL) {
+		g_atomic_int_set(&initialized, 0);
+		JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the PubSub handler thread...\n", error->code, error->message ? error->message : "??");
+		return -1;
+	}
 	JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_PUBSUB_NAME);
 	return 0;
 }
@@ -124,12 +172,17 @@ void janus_pubsub_destroy(void) {
 	if(!g_atomic_int_get(&initialized))
 		return;
 	g_atomic_int_set(&stopping, 1);
-        /* FIXME Destroy the sessions cleanly */
-        janus_mutex_lock(&sessions_mutex);
+	g_async_queue_push(messages, &exit_message);
+	if(handler_thread != NULL) {
+		g_thread_join(handler_thread);
+		handler_thread = NULL;
+	}
+	/* FIXME Destroy the sessions cleanly */
+	janus_mutex_lock(&sessions_mutex);
 	g_hash_table_destroy(sessions);
 	janus_mutex_unlock(&sessions_mutex);
-        sessions = NULL;
-        g_atomic_int_set(&initialized, 0);
+	sessions = NULL;
+	g_atomic_int_set(&initialized, 0);
 	g_atomic_int_set(&stopping, 0);
 	JANUS_LOG(LOG_INFO, "%s destroyed!\n", JANUS_PUBSUB_NAME);
 }
@@ -229,13 +282,30 @@ json_t *janus_pubsub_query_session(janus_plugin_session *handle) {
 	}
 	/* In the echo test, every session is the same: we just provide some configure info */
 	json_t *info = json_object();
-        janus_mutex_unlock(&sessions_mutex);
-        // XXX: Populate info
+	janus_mutex_unlock(&sessions_mutex);
+	// XXX: Populate info
 	return info;
 }
 
 struct janus_plugin_result *janus_pubsub_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep) {
-	return janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, json_object());
+
+	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
+		return janus_plugin_result_new(JANUS_PLUGIN_ERROR, g_atomic_int_get(&stopping) ? "Shutting down" : "Plugin not initialized", NULL);
+
+	janus_pubsub_message *msg = g_malloc0(sizeof(janus_pubsub_message));
+	msg->handle = handle;
+	msg->transaction = transaction;
+	msg->message = message;
+	msg->jsep = jsep;
+	g_async_queue_push(messages, msg);
+
+	/* All the requests to this plugin are handled asynchronously: we add a comment
+	 * (a JSON object with a "hint" string in it, that's what the core expects),
+	 * but we don't have to: other plugins don't put anything in there */
+	return janus_plugin_result_new(JANUS_PLUGIN_OK_WAIT, "I'm taking my time!", NULL);
+
+	JANUS_LOG(LOG_INFO, "PubSub got message. (%s)\n", json_object_get(message, "video"));
+	return janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, NULL);
 }
 
 void janus_pubsub_setup_media(janus_plugin_session *handle) {
@@ -260,4 +330,186 @@ void janus_pubsub_slow_link(janus_plugin_session *handle, int uplink, int video)
 
 void janus_pubsub_hangup_media(janus_plugin_session *handle) {
 	JANUS_LOG(LOG_INFO, "No WebRTC media anymore.\n");
+}
+
+/* Thread to handle incoming messages */
+static void *janus_pubsub_handler(void *data) {
+	JANUS_LOG(LOG_VERB, "Joining PubSub handler thread\n");
+	janus_pubsub_message *msg = NULL;
+	int error_code = 0;
+	char *error_cause = g_malloc0(512);
+	json_t *root = NULL;
+	while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
+		msg = g_async_queue_pop(messages);
+		if(msg == NULL)
+			continue;
+		if(msg == &exit_message)
+			break;
+		if(msg->handle == NULL) {
+			janus_pubsub_message_free(msg);
+			continue;
+		}
+		janus_pubsub_session *session = NULL;
+		janus_mutex_lock(&sessions_mutex);
+		if(g_hash_table_lookup(sessions, msg->handle) != NULL ) {
+			session = (janus_pubsub_session *)msg->handle->plugin_handle;
+		}
+		if(!session) {
+			janus_mutex_unlock(&sessions_mutex);
+			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
+			janus_pubsub_message_free(msg);
+			continue;
+		}
+		if(session->destroyed) {
+			janus_mutex_unlock(&sessions_mutex);
+			janus_pubsub_message_free(msg);
+			continue;
+		}
+		janus_mutex_unlock(&sessions_mutex);
+
+		/* Handle request */
+		error_code = 0;
+		root = msg->message;
+		if(msg->message == NULL) {
+			JANUS_LOG(LOG_ERR, "No message??\n");
+			error_code = JANUS_PUBSUB_ERROR_NO_MESSAGE;
+			g_snprintf(error_cause, 512, "%s", "No message??");
+			goto error;
+		}
+		if(!json_is_object(root)) {
+			JANUS_LOG(LOG_ERR, "JSON error: not an object\n");
+			error_code = JANUS_PUBSUB_ERROR_INVALID_JSON;
+			g_snprintf(error_cause, 512, "JSON error: not an object");
+			goto error;
+		}
+		/* Parse request */
+		const char *msg_sdp_type = json_string_value(json_object_get(msg->jsep, "type"));
+		const char *msg_sdp = json_string_value(json_object_get(msg->jsep, "sdp"));
+		json_t *audio = json_object_get(root, "audio");
+		if(audio && !json_is_boolean(audio)) {
+			JANUS_LOG(LOG_ERR, "Invalid element (audio should be a boolean)\n");
+			error_code = JANUS_PUBSUB_ERROR_INVALID_ELEMENT;
+			g_snprintf(error_cause, 512, "Invalid value (audio should be a boolean)");
+			goto error;
+		}
+		json_t *video = json_object_get(root, "video");
+		if(video && !json_is_boolean(video)) {
+			JANUS_LOG(LOG_ERR, "Invalid element (video should be a boolean)\n");
+			error_code = JANUS_PUBSUB_ERROR_INVALID_ELEMENT;
+			g_snprintf(error_cause, 512, "Invalid value (video should be a boolean)");
+			goto error;
+		}
+		json_t *bitrate = json_object_get(root, "bitrate");
+		if(bitrate && (!json_is_integer(bitrate) || json_integer_value(bitrate) < 0)) {
+			JANUS_LOG(LOG_ERR, "Invalid element (bitrate should be a positive integer)\n");
+			error_code = JANUS_PUBSUB_ERROR_INVALID_ELEMENT;
+			g_snprintf(error_cause, 512, "Invalid value (bitrate should be a positive integer)");
+			goto error;
+		}
+		json_t *record = json_object_get(root, "record");
+		if(record && !json_is_boolean(record)) {
+			JANUS_LOG(LOG_ERR, "Invalid element (record should be a boolean)\n");
+			error_code = JANUS_PUBSUB_ERROR_INVALID_ELEMENT;
+			g_snprintf(error_cause, 512, "Invalid value (record should be a boolean)");
+			goto error;
+		}
+		json_t *recfile = json_object_get(root, "filename");
+		if(recfile && !json_is_string(recfile)) {
+			JANUS_LOG(LOG_ERR, "Invalid element (filename should be a string)\n");
+			error_code = JANUS_PUBSUB_ERROR_INVALID_ELEMENT;
+			g_snprintf(error_cause, 512, "Invalid value (filename should be a string)");
+			goto error;
+		}
+
+		/* Enforce request */
+		if(audio) {
+			session->audio_active = json_is_true(audio);
+			JANUS_LOG(LOG_VERB, "Setting audio property: %s\n", session->audio_active ? "true" : "false");
+		}
+		if(video) {
+			if(!session->video_active && json_is_true(video)) {
+				/* Send a PLI */
+				JANUS_LOG(LOG_VERB, "Just (re-)enabled video, sending a PLI to recover it\n");
+				char buf[12];
+				memset(buf, 0, 12);
+				janus_rtcp_pli((char *)&buf, 12);
+				gateway->relay_rtcp(session->handle, 1, buf, 12);
+			}
+			session->video_active = json_is_true(video);
+			JANUS_LOG(LOG_VERB, "Setting video property: %s\n", session->video_active ? "true" : "false");
+		}
+		if(bitrate) {
+			session->bitrate = json_integer_value(bitrate);
+			JANUS_LOG(LOG_VERB, "Setting video bitrate: %"SCNu32"\n", session->bitrate);
+			if(session->bitrate > 0) {
+				/* FIXME Generate a new REMB (especially useful for Firefox, which doesn't send any we can cap later) */
+				char buf[24];
+				memset(buf, 0, 24);
+				janus_rtcp_remb((char *)&buf, 24, session->bitrate);
+				JANUS_LOG(LOG_VERB, "Sending REMB\n");
+				gateway->relay_rtcp(session->handle, 1, buf, 24);
+				/* FIXME How should we handle a subsequent "no limit" bitrate? */
+			}
+		}
+                //TODO
+
+		/* Any SDP to handle? */
+		if(msg_sdp) {
+			JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well:\n%s\n", msg_sdp_type, msg_sdp);
+			session->has_audio = (strstr(msg_sdp, "m=audio") != NULL);
+			session->has_video = (strstr(msg_sdp, "m=video") != NULL);
+			session->has_data = (strstr(msg_sdp, "DTLS/SCTP") != NULL);
+
+			json_t *event = json_object();
+			json_object_set_new(event, "pubsub", json_string("event"));
+			json_object_set_new(event, "result", json_string("ok"));
+			/* Answer the offer and send it to the gateway, to start the echo test */
+			const char *type = "answer";
+			char error_str[512];
+			janus_sdp *offer = janus_sdp_parse(msg_sdp, error_str, sizeof(error_str));
+			if(offer == NULL) {
+				json_decref(event);
+				JANUS_LOG(LOG_ERR, "Error parsing offer: %s\n", error_str);
+				error_code = JANUS_PUBSUB_ERROR_INVALID_SDP;
+				g_snprintf(error_cause, 512, "Error parsing offer: %s", error_str);
+				goto error;
+			}
+			janus_sdp *answer = janus_sdp_generate_answer(offer, JANUS_SDP_OA_DONE);
+			char *sdp = janus_sdp_write(answer);
+			janus_sdp_free(offer);
+			janus_sdp_free(answer);
+			json_t *jsep = json_pack("{ssss}", "type", type, "sdp", sdp);
+			/* How long will the gateway take to push the event? */
+			g_atomic_int_set(&session->hangingup, 0);
+			gint64 start = janus_get_monotonic_time();
+			int res = gateway->push_event(msg->handle, &janus_pubsub_plugin, msg->transaction, event, jsep);
+			JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (took %"SCNu64" us)\n",
+				res, janus_get_monotonic_time()-start);
+			g_free(sdp);
+			/* We don't need the event and jsep anymore */
+			json_decref(event);
+			json_decref(jsep);
+		}
+
+		//TODO
+
+		janus_pubsub_message_free(msg);
+		continue;
+error:
+		{
+			/* Prepare JSON error event */
+			json_t *event = json_object();
+			json_object_set_new(event, "pubsub", json_string("event"));
+			json_object_set_new(event, "error_code", json_integer(error_code));
+			json_object_set_new(event, "error", json_string(error_cause));
+			int ret = gateway->push_event(msg->handle, &janus_pubsub_plugin, msg->transaction, event, NULL);
+			JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
+			janus_pubsub_message_free(msg);
+			/* We don't need the event anymore */
+			json_decref(event);
+		}
+	}
+	//g_free(error_cause);
+	JANUS_LOG(LOG_VERB, "Leaving EchoTest handler thread\n");
+	return NULL;
 }
