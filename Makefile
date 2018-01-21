@@ -3,23 +3,25 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
     LIBNAME=janus_pubsub
     LIBOUTNAME=$(LIBNAME).so
-    CFLAGS=-D LINUX -std=c99 -fpic -I. -I/usr/include/janus/ \
+    CFLAGS=-D LINUX -D HAVE_SRTP_2 -std=c99 -fpic -I. -I/usr/include/janus/ \
            `pkg-config --cflags glib-2.0 jansson` -D_POSIX_C_SOURCE=200112L -c -g
     LDFLAGS=`pkg-config --libs glib-2.0 jansson`
     BUILD_DIR=build
     # XXX: These are debian specific install locations (ones where a debian
     # package would install too). They should be generic instead.
     INSTALL_DIR=/usr/lib/x86_64-linux-gnu/janus/plugins
-    INSTALL_CONIG_DIR=/etc/janus/
+    INSTALL_CONF_DIR=/etc/janus/
     LDFLAGS=-o $(LIBOUT) $(BUILD_DIR)/$(LIBNAME).o
 endif
 ifeq ($(UNAME_S),Darwin)
     LIBNAME=janus_pubsub
     LIBOUTNAME=$(LIBNAME).0.dylib
-    CFLAGS=-D OSX -std=c99 -fpic -I. -I/usr/local/janus/include/janus/ \
+    CFLAGS=-D OSX -D HAVE_SRTP_2 -std=c99 -fpic -I. -I/usr/local/janus/include/janus/ \
+           -Duint="unsigned int" \
+           -I/usr/local/opt/openssl/include \
            `pkg-config --cflags glib-2.0 jansson` -D_POSIX_C_SOURCE=200112L -c -g
     INSTALL_DIR=/usr/local/janus/lib/janus/plugins/
-    INSTALL_CONIG_DIR=/usr/local/janus/etc/janus
+    INSTALL_CONF_DIR=/usr/local/janus/etc/janus
     LDFLAGS=-dynamiclib -undefined suppress -flat_namespace \
             -o $(BUILD_DIR)/$(LIBOUTNAME)  $(BUILD_DIR)/$(LIBNAME).o
 endif
@@ -29,6 +31,7 @@ LDFLAGS+= `pkg-config --libs glib-2.0 jansson`
 BUILD_DIR=build
 CONF_SRC=janus.plugin.pubsub.cfg.sample
 CONF_OUT=janus.plugin.pubsub.cfg
+HAVE_SRTP_2=yes
 
 
 all: $(BUILD_DIR)/$(LIBNAME).o $(BUILD_DIR)/$(LIBOUTNAME) $(BUILD_DIR)/$(CONF_OUT)

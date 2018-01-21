@@ -1,13 +1,20 @@
 #include <jansson.h>
+#include <sys/types.h>
 #include <plugins/plugin.h>
 #include <debug.h>
 #include <config.h>
+#include <mutex.h>
+#include <rtp.h>
+#include <rtcp.h>
+#include <record.h>
+#include <sdp-utils.h>
+#include <utils.h>
 
 #define JANUS_PUBSUB_VERSION 1
 #define JANUS_PUBSUB_VERSION_STRING	"0.0.1"
 #define JANUS_PUBSUB_DESCRIPTION "The simplest possible Janus plugin."
-#define JANUS_PUBSUB_NAME "JANUS pub sub plugin"
-#define JANUS_PUBSUB_AUTHOR	"Marshall Quander"
+#define JANUS_PUBSUB_NAME "Janus PubSub plugin"
+#define JANUS_PUBSUB_AUTHOR	"Daniel Wozniak"
 #define JANUS_PUBSUB_PACKAGE "janus.plugin.pubsub"
 
 janus_plugin *create(void);
@@ -56,8 +63,27 @@ static janus_plugin janus_pubsub_plugin =
 		.query_session = janus_pubsub_query_session,
 	);
 
-
+static volatile gint initialized = 0, stopping = 0;
 static gboolean notify_events = TRUE;
+typedef struct janus_pubsub_session {
+	janus_plugin_session *handle;
+	gboolean has_audio;
+	gboolean has_video;
+	gboolean has_data;
+	gboolean audio_active;
+	gboolean video_active;
+	uint32_t bitrate;
+	janus_recorder *arc;	/* The Janus recorder instance for this user's audio, if enabled */
+	janus_recorder *vrc;	/* The Janus recorder instance for this user's video, if enabled */
+	janus_recorder *drc;	/* The Janus recorder instance for this user's data, if enabled */
+	janus_mutex rec_mutex;	/* Mutex to protect the recorders from race conditions */
+	guint16 slowlink_count;
+	volatile gint hangingup;
+	gint64 destroyed;	/* Time at which this session was marked as destroyed */
+} janus_pubsub_session;
+static GHashTable *sessions;
+static GList *old_sessions;
+static janus_mutex sessions_mutex;
 
 janus_plugin *create(void) {
 	JANUS_LOG(LOG_VERB, "%s created!\n", JANUS_PUBSUB_NAME);
@@ -86,12 +112,25 @@ int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
 	}
 	janus_config_destroy(config);
 	config = NULL;
+        sessions = g_hash_table_new(NULL, NULL);
+	janus_mutex_init(&sessions_mutex);
+        g_atomic_int_set(&initialized, 1);
 	JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_PUBSUB_NAME);
 	return 0;
 }
 
 
 void janus_pubsub_destroy(void) {
+	if(!g_atomic_int_get(&initialized))
+		return;
+	g_atomic_int_set(&stopping, 1);
+        /* FIXME Destroy the sessions cleanly */
+        janus_mutex_lock(&sessions_mutex);
+	g_hash_table_destroy(sessions);
+	janus_mutex_unlock(&sessions_mutex);
+        sessions = NULL;
+        g_atomic_int_set(&initialized, 0);
+	g_atomic_int_set(&stopping, 0);
 	JANUS_LOG(LOG_INFO, "%s destroyed!\n", JANUS_PUBSUB_NAME);
 }
 
@@ -123,17 +162,76 @@ const char *janus_pubsub_get_package(void) {
 	return JANUS_PUBSUB_PACKAGE;
 }
 
+static janus_pubsub_session *janus_pubsub_lookup_session(janus_plugin_session *handle) {
+	janus_pubsub_session *session = NULL;
+	if (g_hash_table_contains(sessions, handle)) {
+		session = (janus_pubsub_session *)handle->plugin_handle;
+	}
+	return session;
+}
 
 void janus_pubsub_create_session(janus_plugin_session *handle, int *error) {
-	JANUS_LOG(LOG_INFO, "Session created.\n");
+        if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
+	  *error = -1;
+	  return;
+	}
+	janus_pubsub_session *session = (janus_pubsub_session *)g_malloc0(sizeof(janus_pubsub_session));
+	session->handle = handle;
+	session->has_audio = FALSE;
+	session->has_video = FALSE;
+	session->has_data = FALSE;
+	session->audio_active = TRUE;
+	session->video_active = TRUE;
+	janus_mutex_init(&session->rec_mutex);
+	session->bitrate = 0;	/* No limit */
+	session->destroyed = 0;
+	g_atomic_int_set(&session->hangingup, 0);
+	handle->plugin_handle = session;
+	janus_mutex_lock(&sessions_mutex);
+	g_hash_table_insert(sessions, handle, session);
+	janus_mutex_unlock(&sessions_mutex);
+	JANUS_LOG(LOG_INFO, "PubSub Session created.\n");
 }
 
 void janus_pubsub_destroy_session(janus_plugin_session *handle, int *error) {
-	JANUS_LOG(LOG_INFO, "Session destroyed.\n");
+	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
+		*error = -1;
+		return;
+	}
+	janus_pubsub_session *session = (janus_pubsub_session *)handle->plugin_handle;
+	if(!session) {
+		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
+		*error = -2;
+		return;
+	}
+	JANUS_LOG(LOG_VERB, "Removing Echo Test session...\n");
+	janus_mutex_lock(&sessions_mutex);
+	if(!session->destroyed) {
+		session->destroyed = janus_get_monotonic_time();
+		g_hash_table_remove(sessions, handle);
+		/* Cleaning up and removing the session is done in a lazy way */
+		old_sessions = g_list_append(old_sessions, session);
+	}
+	janus_mutex_unlock(&sessions_mutex);
+	JANUS_LOG(LOG_INFO, "PubSub Session destroyed.\n");
 }
 
 json_t *janus_pubsub_query_session(janus_plugin_session *handle) {
-	return json_object();
+	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
+		return NULL;
+	}
+	janus_mutex_lock(&sessions_mutex);
+	janus_pubsub_session *session = janus_pubsub_lookup_session(handle);
+	if(!session) {
+		janus_mutex_unlock(&sessions_mutex);
+		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
+		return NULL;
+	}
+	/* In the echo test, every session is the same: we just provide some configure info */
+	json_t *info = json_object();
+        janus_mutex_unlock(&sessions_mutex);
+        // XXX: Populate info
+	return info;
 }
 
 struct janus_plugin_result *janus_pubsub_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep) {
