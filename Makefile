@@ -19,6 +19,7 @@ ifeq ($(UNAME_S),Darwin)
     CFLAGS=-D OSX -D HAVE_SRTP_2 -std=c99 -fpic -I. -I/usr/local/janus/include/janus/ \
            -Duint="unsigned int" \
            -I/usr/local/opt/openssl/include \
+           -I/usr/local/opt/curl/include \
            `pkg-config --cflags glib-2.0 jansson` -D_POSIX_C_SOURCE=200112L -c -g
     INSTALL_DIR=/usr/local/janus/lib/janus/plugins/
     INSTALL_CONF_DIR=/usr/local/janus/etc/janus
@@ -27,12 +28,12 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 
-LDFLAGS+= `pkg-config --libs glib-2.0 jansson`
+LDFLAGS+= `pkg-config --libs glib-2.0 jansson` \
+          -L/usr/local/opt/curl/lib
 BUILD_DIR=build
 CONF_SRC=janus.plugin.pubsub.cfg.sample
 CONF_OUT=janus.plugin.pubsub.cfg
 HAVE_SRTP_2=yes
-
 
 all: $(BUILD_DIR)/$(LIBNAME).o $(BUILD_DIR)/$(LIBOUTNAME) $(BUILD_DIR)/$(CONF_OUT)
 

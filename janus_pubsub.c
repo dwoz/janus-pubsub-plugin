@@ -9,6 +9,7 @@
 #include <record.h>
 #include <sdp-utils.h>
 #include <utils.h>
+#include <curl/curl.h>
 
 #define JANUS_PUBSUB_VERSION 1
 #define JANUS_PUBSUB_VERSION_STRING	"0.0.1"
@@ -75,11 +76,13 @@ typedef struct janus_pubsub_message {
 	json_t *message;
 	json_t *jsep;
 } janus_pubsub_message;
+
 static GAsyncQueue *messages = NULL;
 static janus_pubsub_message exit_message;
 
 typedef struct janus_pubsub_session {
 	janus_plugin_session *handle;
+        gchar *stream_name;
 	gboolean has_audio;
 	gboolean has_video;
 	gboolean has_data;
@@ -95,7 +98,15 @@ typedef struct janus_pubsub_session {
 	gint64 destroyed;	/* Time at which this session was marked as destroyed */
 } janus_pubsub_session;
 
+typedef struct jansus_pubsub_stream {
+        gchar *name;
+	gchar *sdp;			/* The SDP this publisher negotiated, if any */
+        janus_pubsub_session *publisher;
+	GHashTable *subscribers;
 
+} janus_pubsub_stream;
+
+static GHashTable *streams;
 static GHashTable *sessions;
 static GList *old_sessions;
 static janus_mutex sessions_mutex;
@@ -161,6 +172,7 @@ static void *janus_pubsub_watchdog(void *data) {
 				sl = sl->next;
 			}
 		}
+		/* TODO Teardown streams too */
 		janus_mutex_unlock(&sessions_mutex);
 		g_usleep(500000);
 	}
@@ -191,6 +203,7 @@ int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
 	janus_config_destroy(config);
 	config = NULL;
 	gateway = callback;
+	streams = g_hash_table_new(g_str_hash, g_str_equal);
 	sessions = g_hash_table_new(NULL, NULL);
 	janus_mutex_init(&sessions_mutex);
 	g_atomic_int_set(&initialized, 1);
@@ -212,6 +225,7 @@ int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
                         error->code, error->message ? error->message : "??");
 		return -1;
 	}
+        curl_global_init(CURL_GLOBAL_ALL);
 	JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_PUBSUB_NAME);
 	return 0;
 }
@@ -232,6 +246,8 @@ void janus_pubsub_destroy(void) {
 	}
 	/* FIXME Destroy the sessions cleanly */
 	janus_mutex_lock(&sessions_mutex);
+	// TODO
+        // g_hash_table_destroy(streams);
 	g_hash_table_destroy(sessions);
 	janus_mutex_unlock(&sessions_mutex);
 	sessions = NULL;
@@ -288,6 +304,7 @@ void janus_pubsub_create_session(janus_plugin_session *handle, int *error) {
 	session->has_data = FALSE;
 	session->audio_active = TRUE;
 	session->video_active = TRUE;
+        session->stream_name = NULL;
 	janus_mutex_init(&session->rec_mutex);
 	session->bitrate = 0;	/* No limit */
 	session->destroyed = 0;
@@ -319,6 +336,7 @@ void janus_pubsub_destroy_session(janus_plugin_session *handle, int *error) {
 		old_sessions = g_list_append(old_sessions, session);
 	}
 	janus_mutex_unlock(&sessions_mutex);
+        curl_global_cleanup();
 	JANUS_LOG(LOG_INFO, "PubSub Session destroyed.\n");
 }
 
@@ -435,9 +453,7 @@ static void *janus_pubsub_handler(void *data) {
 			g_snprintf(error_cause, 512, "JSON error: not an object");
 			goto error;
 		}
-		/* Parse request */
-		const char *msg_sdp_type = json_string_value(json_object_get(msg->jsep, "type"));
-		const char *msg_sdp = json_string_value(json_object_get(msg->jsep, "sdp"));
+
 		json_t *audio = json_object_get(root, "audio");
 		if(audio && !json_is_boolean(audio)) {
 			JANUS_LOG(LOG_ERR, "Invalid element (audio should be a boolean)\n");
@@ -473,6 +489,85 @@ static void *janus_pubsub_handler(void *data) {
 			g_snprintf(error_cause, 512, "Invalid value (filename should be a string)");
 			goto error;
 		}
+
+		/* Parse request */
+		const char *msg_sdp_type = json_string_value(json_object_get(msg->jsep, "type"));
+		const char *msg_sdp = json_string_value(json_object_get(msg->jsep, "sdp"));
+
+		json_t *request = json_object_get(root, "request");
+		const char *request_text = json_string_value(request);
+
+		if(!strcasecmp(request_text, "publish")) {
+			json_t *name = json_object_get(root, "name");
+                        char *fook = malloc(2048);
+		        const char *publish_name = json_string_value(name);
+
+                        struct curl_slist *headers = NULL;
+                        headers = curl_slist_append(headers, "Accept: application/json");
+                        headers = curl_slist_append(headers, "Content-Type: application/json");
+                        
+                        /* Example curl request */
+                        CURL *curl = curl_easy_init();
+                        curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:5000/publish");
+                        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+                        //char *post_data = (char*)malloc(4096 * sizeof(char));
+                        //sprintf(post_data, "name=%s", publish_name);
+                        json_t *post_msg = json_pack("{soso}", "msg", root, "jesp", msg->jsep);
+                        char *post_data = json_dumps(post_msg, JSON_ENCODE_ANY);
+                        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+                        CURLcode res = curl_easy_perform(curl);
+
+                        if(res != CURLE_OK) {
+                                JANUS_LOG(LOG_WARN, "CURL RESP NOT OK \n");
+                        } else {
+				janus_pubsub_stream *stream = g_malloc0(sizeof(janus_pubsub_stream));
+                                stream->name = g_strdup(publish_name);
+                                stream->publisher = session;
+                                stream->sdp = msg_sdp ? g_strdup(msg_sdp) : NULL;
+                                session->stream_name = g_strdup(stream->name);
+	                        g_hash_table_insert(streams, g_strdup(publish_name), stream);
+                                JANUS_LOG(LOG_WARN, "CURL RESP OK (%s)\n", stream->name);
+                        }
+                        curl_easy_cleanup(curl);
+                        free(post_data);
+                }
+                
+		if(!strcasecmp(request_text, "play")) {
+			json_t *name = json_object_get(root, "name");
+		        const char *play_name = json_string_value(name);
+
+                        struct curl_slist *headers = NULL;
+                        headers = curl_slist_append(headers, "Accept: application/json");
+                        headers = curl_slist_append(headers, "Content-Type: application/json");
+                        
+                        /* Example curl request */
+                        CURL *curl = curl_easy_init();
+                        curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:5000/play");
+                        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+                        //char *post_data = (char*)malloc(4096 * sizeof(char));
+                        //sprintf(post_data, "name=%s", play_name);
+                        json_t *post_msg = json_pack("{so}", "msg", root);
+                        char *post_data = json_dumps(post_msg, JSON_ENCODE_ANY);
+                        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+
+
+                        CURLcode res = curl_easy_perform(curl);
+                        if(res != CURLE_OK) {
+                                JANUS_LOG(LOG_WARN, "CURL PLAY RESP NOT OK \n");
+                        } else {
+
+		                janus_pubsub_stream *stream_c = g_hash_table_lookup(streams, play_name);
+                                if (stream_c != NULL) {
+                                    JANUS_LOG(LOG_WARN, "CURL PLAY RESP OK (%s) \n", (char *)stream_c->sdp);
+                                } else {
+                                    JANUS_LOG(LOG_WARN, "CURL PLAY RESP OK BUT NO STREAM \n");
+                                }
+                        }
+                        curl_easy_cleanup(curl);
+                        free(post_data);
+                }
 
 		/* Enforce request */
 		if(audio) {
