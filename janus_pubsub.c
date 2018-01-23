@@ -101,6 +101,7 @@ typedef struct janus_pubsub_session {
 typedef struct jansus_pubsub_stream {
         gchar *name;
 	gchar *sdp;			/* The SDP this publisher negotiated, if any */
+	gchar *sdp_type;		
         janus_pubsub_session *publisher;
 	GHashTable *subscribers;
 
@@ -382,13 +383,103 @@ struct janus_plugin_result *janus_pubsub_handle_message(janus_plugin_session *ha
 void janus_pubsub_setup_media(janus_plugin_session *handle) {
 	JANUS_LOG(LOG_INFO, "WebRTC media is now available.\n");
 }
-
+int once_c=0;
 void janus_pubsub_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len) {
-	JANUS_LOG(LOG_VERB, "Got an RTP message (%d bytes.)\n", len);
-}
+	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
+		return;
+	/* Simple echo test */
+	if(gateway) {
+		/* Honour the audio/video active flags */
+		janus_pubsub_session *session = (janus_pubsub_session *)handle->plugin_handle;	
+		if(!session) {
+			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
+			return;
+		}
+		if(session->destroyed)
+			return;
 
+		janus_pubsub_stream *stream = g_hash_table_lookup(streams, session->stream_name);
+		int count = 0;
+		GHashTableIter iter;
+		gpointer value;
+		g_hash_table_iter_init(&iter, stream->subscribers);
+		while (!session->destroyed && g_hash_table_iter_next(&iter, NULL, &value)) {
+                        if (once_c == 0) {
+                                JANUS_LOG(LOG_WARN, "RTP Relay %d bytes\n", len);
+                                once_c = 1;
+                        }
+			janus_pubsub_session *p = value;
+			gateway->relay_rtp(p->handle, video, buf, len);
+		}
+		//if((!video && session->audio_active) || (video && session->video_active)) {
+		//	/* Save the frame if we're recording */
+		//	janus_recorder_save_frame(video ? session->vrc : session->arc, buf, len);
+		//	/* Send the frame back */
+		//	gateway->relay_rtp(handle, video, buf, len);
+		//}
+	}
+	JANUS_LOG(LOG_VERB, "OUT - Got an RTP message (%d bytes.)\n", len);
+}
+int once_a = 0;
+int once_b = 0;
 void janus_pubsub_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len) {
-	JANUS_LOG(LOG_VERB, "Got an RTCP message (%d bytes.)\n", len);
+	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
+		return;
+	/* Simple echo test */
+	if(gateway) {
+		janus_pubsub_session *session = (janus_pubsub_session *)handle->plugin_handle;	
+		if(!session) {
+			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
+			return;
+		}
+		if(session->destroyed)
+			return;
+                if (session->stream_name == NULL) {
+                        if (once_a == 0) {
+                            JANUS_LOG(LOG_ERR, "NULL STREAM\n");
+                            once_a = 1;
+                        }
+                } else {
+                        if (once_b == 0) {
+                            once_b = 1;
+                            JANUS_LOG(LOG_ERR, "NOT NULL STREAM\n");
+                        }
+                }
+
+		janus_pubsub_stream *stream = g_hash_table_lookup(streams, session->stream_name);
+		guint32 bitrate = janus_rtcp_get_remb(buf, len);
+                if (session->handle == stream->publisher->handle) {
+                        JANUS_LOG(LOG_ERR, "publisher rtp\b\n");
+                        int count = 0;
+                        GHashTableIter iter;
+                        gpointer value;
+                        g_hash_table_iter_init(&iter, stream->subscribers);
+		        while (!session->destroyed && g_hash_table_iter_next(&iter, NULL, &value)) {
+			    janus_pubsub_session *p = value;
+                            if(bitrate > 0) {
+                                    /* If a REMB arrived, make sure we cap it to our configuration, and send it as a video RTCP */
+                                    if(session->bitrate > 0)
+                                            janus_rtcp_cap_remb(buf, len, session->bitrate);
+                                    gateway->relay_rtcp(p->handle, 1, buf, len);
+                                    continue;
+                            }
+                            gateway->relay_rtcp(p->handle, video, buf, len);
+                        }
+                } else {
+                        JANUS_LOG(LOG_ERR, "player rtp\b\n");
+                        if(bitrate > 0) {
+                                /* If a REMB arrived, make sure we cap it to our configuration, and send it as a video RTCP */
+                                if(session->bitrate > 0)
+                                        janus_rtcp_cap_remb(buf, len, session->bitrate);
+                                gateway->relay_rtcp(stream->publisher->handle, 1, buf, len);
+                                return;
+                        }
+                        gateway->relay_rtcp(stream->publisher->handle, video, buf, len);
+
+                }
+
+	}
+	JANUS_LOG(LOG_VERB, "OUT - Got an RTCP message (%d bytes.)\n", len);
 }
 
 void janus_pubsub_incoming_data(janus_plugin_session *handle, char *buf, int len) {
@@ -468,6 +559,13 @@ static void *janus_pubsub_handler(void *data) {
 			g_snprintf(error_cause, 512, "Invalid value (video should be a boolean)");
 			goto error;
 		}
+		json_t *data = json_object_get(root, "data");
+		if(data && !json_is_boolean(data)) {
+			JANUS_LOG(LOG_ERR, "Invalid element (video should be a boolean)\n");
+			error_code = JANUS_PUBSUB_ERROR_INVALID_ELEMENT;
+			g_snprintf(error_cause, 512, "Invalid value (video should be a boolean)");
+			goto error;
+		}
 		json_t *bitrate = json_object_get(root, "bitrate");
 		if(bitrate && (!json_is_integer(bitrate) || json_integer_value(bitrate) < 0)) {
 			JANUS_LOG(LOG_ERR, "Invalid element (bitrate should be a positive integer)\n");
@@ -496,7 +594,7 @@ static void *janus_pubsub_handler(void *data) {
 
 		json_t *request = json_object_get(root, "request");
 		const char *request_text = json_string_value(request);
-
+                janus_pubsub_stream *stream = NULL;
 		if(!strcasecmp(request_text, "publish")) {
 			json_t *name = json_object_get(root, "name");
                         char *fook = malloc(2048);
@@ -511,8 +609,6 @@ static void *janus_pubsub_handler(void *data) {
                         curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:5000/publish");
                         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-                        //char *post_data = (char*)malloc(4096 * sizeof(char));
-                        //sprintf(post_data, "name=%s", publish_name);
                         json_t *post_msg = json_pack("{soso}", "msg", root, "jesp", msg->jsep);
                         char *post_data = json_dumps(post_msg, JSON_ENCODE_ANY);
                         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
@@ -521,10 +617,12 @@ static void *janus_pubsub_handler(void *data) {
                         if(res != CURLE_OK) {
                                 JANUS_LOG(LOG_WARN, "CURL RESP NOT OK \n");
                         } else {
-				janus_pubsub_stream *stream = g_malloc0(sizeof(janus_pubsub_stream));
+		                stream = g_malloc0(sizeof(janus_pubsub_stream));
                                 stream->name = g_strdup(publish_name);
                                 stream->publisher = session;
-                                stream->sdp = msg_sdp ? g_strdup(msg_sdp) : NULL;
+			        stream->subscribers = g_hash_table_new(NULL, NULL);
+                                stream->sdp = NULL; //msg_sdp ? g_strdup(msg_sdp) : NULL;
+                                stream->sdp_type = NULL; //msg_sdp ? g_strdup(msg_sdp_type) : NULL;
                                 session->stream_name = g_strdup(stream->name);
 	                        g_hash_table_insert(streams, g_strdup(publish_name), stream);
                                 JANUS_LOG(LOG_WARN, "CURL RESP OK (%s)\n", stream->name);
@@ -546,8 +644,6 @@ static void *janus_pubsub_handler(void *data) {
                         curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:5000/play");
                         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-                        //char *post_data = (char*)malloc(4096 * sizeof(char));
-                        //sprintf(post_data, "name=%s", play_name);
                         json_t *post_msg = json_pack("{so}", "msg", root);
                         char *post_data = json_dumps(post_msg, JSON_ENCODE_ANY);
                         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
@@ -557,16 +653,27 @@ static void *janus_pubsub_handler(void *data) {
                         if(res != CURLE_OK) {
                                 JANUS_LOG(LOG_WARN, "CURL PLAY RESP NOT OK \n");
                         } else {
-
-		                janus_pubsub_stream *stream_c = g_hash_table_lookup(streams, play_name);
-                                if (stream_c != NULL) {
-                                    JANUS_LOG(LOG_WARN, "CURL PLAY RESP OK (%s) \n", (char *)stream_c->sdp);
+                                json_t *event_x = json_object();
+                                json_object_set_new(event_x, "pubsub", json_string("event"));
+                                json_object_set_new(event_x, "result", json_string("ok"));
+		                stream = g_hash_table_lookup(streams, play_name);
+                                if (stream != NULL) {
+                                    g_hash_table_insert(stream->subscribers, session->handle, session);
+                                    session->stream_name = g_strdup(stream->name);
+                                    json_t *jsep_x = json_pack("{ssss}", "type", stream->sdp_type, "sdp", stream->sdp);
+                                    int res = gateway->push_event(msg->handle, &janus_pubsub_plugin, msg->transaction, event_x, jsep_x);
+                                    json_decref(event_x);
+                                    json_decref(jsep_x);
+                                    JANUS_LOG(LOG_WARN, "CURL PLAY RESP OK (%s) \n", stream->name);
                                 } else {
                                     JANUS_LOG(LOG_WARN, "CURL PLAY RESP OK BUT NO STREAM \n");
                                 }
                         }
                         curl_easy_cleanup(curl);
                         free(post_data);
+                }
+		if(!strcasecmp(request_text, "play")) {
+                        continue;
                 }
 
 		/* Enforce request */
@@ -611,32 +718,68 @@ static void *janus_pubsub_handler(void *data) {
 			json_t *event = json_object();
 			json_object_set_new(event, "pubsub", json_string("event"));
 			json_object_set_new(event, "result", json_string("ok"));
-			/* Answer the offer and send it to the gateway, to start the echo test */
+			// Answer the offer and send it to the gateway, to start the echo test //
 			const char *type = "answer";
 			char error_str[512];
-			janus_sdp *offer = janus_sdp_parse(msg_sdp, error_str, sizeof(error_str));
-			if(offer == NULL) {
-				json_decref(event);
-				JANUS_LOG(LOG_ERR, "Error parsing offer: %s\n", error_str);
-				error_code = JANUS_PUBSUB_ERROR_INVALID_SDP;
-				g_snprintf(error_cause, 512, "Error parsing offer: %s", error_str);
-				goto error;
-			}
-			janus_sdp *answer = janus_sdp_generate_answer(offer, JANUS_SDP_OA_DONE);
-			char *sdp = janus_sdp_write(answer);
-			janus_sdp_free(offer);
-			janus_sdp_free(answer);
-			json_t *jsep = json_pack("{ssss}", "type", type, "sdp", sdp);
-			/* How long will the gateway take to push the event? */
-			g_atomic_int_set(&session->hangingup, 0);
-			gint64 start = janus_get_monotonic_time();
-			int res = gateway->push_event(msg->handle, &janus_pubsub_plugin, msg->transaction, event, jsep);
-			JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (took %"SCNu64" us)\n",
-				res, janus_get_monotonic_time()-start);
-			g_free(sdp);
-			/* We don't need the event and jsep anymore */
-			json_decref(event);
-			json_decref(jsep);
+                        janus_sdp *answer = NULL;
+                        janus_sdp *offer = NULL;
+		        if(!strcasecmp(request_text, "publish")) {
+                                offer = janus_sdp_parse(msg_sdp, error_str, sizeof(error_str));
+                                if(offer == NULL) {
+                                        json_decref(event);
+                                        JANUS_LOG(LOG_ERR, "Error parsing offer: %s\n", error_str);
+                                        error_code = JANUS_PUBSUB_ERROR_INVALID_SDP;
+                                        g_snprintf(error_cause, 512, "Error parsing offer: %s", error_str);
+                                        goto error;
+                                }
+			        answer = janus_sdp_generate_answer(offer, JANUS_SDP_OA_DONE);
+				char *answer_sdp = janus_sdp_write(answer);
+				offer = janus_sdp_generate_offer(answer->s_name, answer->c_addr,
+					JANUS_SDP_OA_AUDIO, TRUE,
+				//	JANUS_SDP_OA_AUDIO_CODEC, janus_videoroom_audiocodec_name(videoroom->acodec),
+					//JANUS_SDP_OA_AUDIO_PT, janus_videoroom_audiocodec_pt(videoroom->acodec),
+					JANUS_SDP_OA_AUDIO_DIRECTION, JANUS_SDP_SENDONLY,
+					JANUS_SDP_OA_VIDEO, TRUE,
+					//JANUS_SDP_OA_VIDEO_CODEC, janus_videoroom_videocodec_name(videoroom->vcodec),
+					//JANUS_SDP_OA_VIDEO_PT, janus_videoroom_videocodec_pt(videoroom->vcodec),
+					JANUS_SDP_OA_VIDEO_DIRECTION, JANUS_SDP_SENDONLY,
+					JANUS_SDP_OA_DATA, TRUE,
+					JANUS_SDP_OA_DONE);
+				char *offer_sdp = janus_sdp_write(offer);
+                                stream->sdp_type = g_strdup(msg_sdp_type);
+                                stream->sdp = g_strdup(msg_sdp);
+			        json_t *jsep = json_pack("{ssss}", "type", type, "sdp", answer_sdp);
+			        int res = gateway->push_event(msg->handle, &janus_pubsub_plugin, msg->transaction, event, jsep);
+
+                        }
+                        //else {
+                                //offer = janus_sdp_parse(stream_c->sdp, error_str, sizeof(error_str));
+                                //offer = janus_sdp_parse(msg_sdp, error_str, sizeof(error_str));
+				//answer = janus_sdp_generate_answer(offer,
+				//	//JANUS_SDP_OA_AUDIO_CODEC, janus_videoroom_audiocodec_name(videoroom->acodec),
+				//	JANUS_SDP_OA_AUDIO_DIRECTION, JANUS_SDP_RECVONLY,
+				//	//JANUS_SDP_OA_VIDEO_CODEC, janus_videoroom_videocodec_name(videoroom->vcodec),
+				//	JANUS_SDP_OA_VIDEO_DIRECTION, JANUS_SDP_RECVONLY,
+				//	JANUS_SDP_OA_DONE);
+                                
+                        //}
+			//janus_sdp_free(offer);
+			//char *sdp = janus_sdp_write(answer);
+			////janus_sdp_free(offer);
+			//janus_sdp_free(answer);
+			//json_t *jsep = json_pack("{ssss}", "type", type, "sdp", sdp);
+			// How long will the gateway take to push the event? //
+			//g_atomic_int_set(&session->hangingup, 0);
+			//gint64 start = janus_get_monotonic_time();
+			//int res = gateway->push_event(msg->handle, &janus_pubsub_plugin, msg->transaction, event, jsep);
+		//	JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (took %"SCNu64" us)\n",
+		//		1, janus_get_monotonic_time()-start);
+                                // res,
+			//g_free(sdp);
+			// We don't need the event and jsep anymore //
+			//json_decref(event);
+			//json_decref(jsep);
+
 		}
 
 		//TODO
