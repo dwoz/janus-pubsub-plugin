@@ -84,7 +84,7 @@ static janus_pubsub_message exit_message;
 
 typedef struct janus_pubsub_session {
     janus_plugin_session *handle;
-        gchar *stream_name;
+    gchar *stream_name;
     gboolean has_audio;
     gboolean has_video;
     gboolean has_data;
@@ -101,10 +101,10 @@ typedef struct janus_pubsub_session {
 } janus_pubsub_session;
 
 typedef struct jansus_pubsub_stream {
-        gchar *name;
+    gchar *name;
     gchar *sdp;            /* The SDP this publisher negotiated, if any */
     gchar *sdp_type;
-        janus_pubsub_session *publisher;
+    janus_pubsub_session *publisher;
     GHashTable *subscribers;
 
 } janus_pubsub_stream;
@@ -120,6 +120,7 @@ static janus_callbacks *gateway = NULL;
 #define JANUS_PUBSUB_ERROR_INVALID_JSON        412
 #define JANUS_PUBSUB_ERROR_INVALID_ELEMENT    413
 #define JANUS_PUBSUB_ERROR_INVALID_SDP        414
+
 
 static void janus_pubsub_message_free(janus_pubsub_message *msg) {
     if(!msg || msg == &exit_message)
@@ -139,10 +140,12 @@ static void janus_pubsub_message_free(janus_pubsub_message *msg) {
     g_free(msg);
 }
 
+
 janus_plugin *create(void) {
     JANUS_LOG(LOG_VERB, "%s created!\n", JANUS_PUBSUB_NAME);
     return &janus_pubsub_plugin;
 }
+
 
 /* PubSub watchdog/garbage collector (sort of) */
 static void *janus_pubsub_watchdog(void *data) {
@@ -183,6 +186,7 @@ static void *janus_pubsub_watchdog(void *data) {
     return NULL;
 }
 
+
 int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
     if(callback == NULL || config_path == NULL) {
         /* Invalid arguments */
@@ -220,7 +224,7 @@ int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
                         error->code, error->message ? error->message : "??");
         return -1;
     }
-        /* Start message handler thread */
+    /* Start message handler thread */
     handler_thread = g_thread_try_new("pubsub handler", janus_pubsub_handler, NULL, &error);
     if(error != NULL) {
         g_atomic_int_set(&initialized, 0);
@@ -228,7 +232,7 @@ int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
                         error->code, error->message ? error->message : "??");
         return -1;
     }
-        curl_global_init(CURL_GLOBAL_ALL);
+    curl_global_init(CURL_GLOBAL_ALL);
     JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_PUBSUB_NAME);
     return 0;
 }
@@ -250,7 +254,7 @@ void janus_pubsub_destroy(void) {
     /* FIXME Destroy the sessions cleanly */
     janus_mutex_lock(&sessions_mutex);
     // TODO
-        // g_hash_table_destroy(streams);
+    // g_hash_table_destroy(streams);
     g_hash_table_destroy(sessions);
     janus_mutex_unlock(&sessions_mutex);
     sessions = NULL;
@@ -259,33 +263,41 @@ void janus_pubsub_destroy(void) {
     JANUS_LOG(LOG_INFO, "%s destroyed!\n", JANUS_PUBSUB_NAME);
 }
 
+
 int janus_pubsub_get_api_compatibility(void) {
     return JANUS_PLUGIN_API_VERSION;
 }
+
 
 int janus_pubsub_get_version(void) {
     return JANUS_PUBSUB_VERSION;
 }
 
+
 const char *janus_pubsub_get_version_string(void) {
     return JANUS_PUBSUB_VERSION_STRING;
 }
+
 
 const char *janus_pubsub_get_description(void) {
     return JANUS_PUBSUB_DESCRIPTION;
 }
 
+
 const char *janus_pubsub_get_name(void) {
     return JANUS_PUBSUB_NAME;
 }
+
 
 const char *janus_pubsub_get_author(void) {
     return JANUS_PUBSUB_AUTHOR;
 }
 
+
 const char *janus_pubsub_get_package(void) {
     return JANUS_PUBSUB_PACKAGE;
 }
+
 
 static janus_pubsub_session *janus_pubsub_lookup_session(janus_plugin_session *handle) {
     janus_pubsub_session *session = NULL;
@@ -294,6 +306,7 @@ static janus_pubsub_session *janus_pubsub_lookup_session(janus_plugin_session *h
     }
     return session;
 }
+
 
 void janus_pubsub_create_session(janus_plugin_session *handle, int *error) {
     if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
@@ -307,7 +320,7 @@ void janus_pubsub_create_session(janus_plugin_session *handle, int *error) {
     session->has_data = FALSE;
     session->audio_active = TRUE;
     session->video_active = TRUE;
-        session->stream_name = NULL;
+    session->stream_name = NULL;
     janus_mutex_init(&session->rec_mutex);
     session->bitrate = 0;    /* No limit */
     session->destroyed = 0;
@@ -318,6 +331,7 @@ void janus_pubsub_create_session(janus_plugin_session *handle, int *error) {
     janus_mutex_unlock(&sessions_mutex);
     JANUS_LOG(LOG_INFO, "PubSub Session created.\n");
 }
+
 
 void janus_pubsub_destroy_session(janus_plugin_session *handle, int *error) {
     if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
@@ -339,7 +353,7 @@ void janus_pubsub_destroy_session(janus_plugin_session *handle, int *error) {
         old_sessions = g_list_append(old_sessions, session);
     }
     janus_mutex_unlock(&sessions_mutex);
-        curl_global_cleanup();
+    curl_global_cleanup();
     JANUS_LOG(LOG_INFO, "PubSub Session destroyed.\n");
 }
 
@@ -384,6 +398,7 @@ struct janus_plugin_result *janus_pubsub_handle_message(janus_plugin_session *ha
     return janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, NULL);
 }
 
+
 void janus_pubsub_setup_media(janus_plugin_session *handle) {
     JANUS_LOG(LOG_INFO, "WebRTC media is now available.\n");
 }
@@ -409,10 +424,6 @@ void janus_pubsub_incoming_rtp(janus_plugin_session *handle, int video, char *bu
         gpointer value;
         g_hash_table_iter_init(&iter, stream->subscribers);
         while (!session->destroyed && g_hash_table_iter_next(&iter, NULL, &value)) {
-            if (once_c == 0) {
-                JANUS_LOG(LOG_WARN, "RTP Relay %d bytes\n", len);
-                once_c = 1;
-            }
             janus_pubsub_session *p = value;
             gateway->relay_rtp(p->handle, video, buf, len);
         }
@@ -439,10 +450,10 @@ void janus_pubsub_incoming_rtcp(janus_plugin_session *handle, int video, char *b
         }
         if(session->destroyed)
             return;
-                if (session->stream_name == NULL) {
+        if (session->stream_name == NULL) {
             JANUS_LOG(LOG_ERR, "RTCP with no stream...\n");
             return;
-                }
+        }
         janus_pubsub_stream *stream = g_hash_table_lookup(streams, session->stream_name);
         guint32 bitrate = janus_rtcp_get_remb(buf, len);
         if (session->handle == stream->publisher->handle) {
@@ -475,17 +486,21 @@ void janus_pubsub_incoming_rtcp(janus_plugin_session *handle, int video, char *b
     JANUS_LOG(LOG_VERB, "OUT - Got an RTCP message (%d bytes.)\n", len);
 }
 
+
 void janus_pubsub_incoming_data(janus_plugin_session *handle, char *buf, int len) {
     JANUS_LOG(LOG_VERB, "Got a DataChannel message (%d bytes.)\n", len);
 }
+
 
 void janus_pubsub_slow_link(janus_plugin_session *handle, int uplink, int video) {
     JANUS_LOG(LOG_VERB, "Slow link detected.\n");
 }
 
+
 void janus_pubsub_hangup_media(janus_plugin_session *handle) {
     JANUS_LOG(LOG_INFO, "No WebRTC media anymore.\n");
 }
+
 
 /* Thread to handle incoming messages */
 static void *janus_pubsub_handler(void *data) {
