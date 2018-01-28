@@ -105,6 +105,7 @@ typedef struct jansus_pubsub_stream {
     gchar *sdp;            /* The SDP this publisher negotiated, if any */
     gchar *sdp_type;
     janus_pubsub_session *publisher;
+    janus_mutex subscribers_mutex;
     GHashTable *subscribers;
 
 } janus_pubsub_stream;
@@ -112,12 +113,14 @@ typedef struct jansus_pubsub_stream {
 static GHashTable *streams;
 static GHashTable *sessions;
 static GList *old_sessions;
+static GList *old_streams;
+static janus_mutex streams_mutex;
 static janus_mutex sessions_mutex;
 static janus_callbacks *gateway = NULL;
 
 /* Error codes */
-#define JANUS_PUBSUB_ERROR_NO_MESSAGE            411
-#define JANUS_PUBSUB_ERROR_INVALID_JSON        412
+#define JANUS_PUBSUB_ERROR_NO_MESSAGE         411
+#define JANUS_PUBSUB_ERROR_INVALID_JSON       412
 #define JANUS_PUBSUB_ERROR_INVALID_ELEMENT    413
 #define JANUS_PUBSUB_ERROR_INVALID_SDP        414
 
@@ -166,6 +169,22 @@ static void *janus_pubsub_watchdog(void *data) {
                 }
                 if(now-session->destroyed >= 5*G_USEC_PER_SEC) {
                     /* We're lazy and actually get rid of the stuff only after a few seconds */
+
+                    /* First clean up stream record */
+                    //if (session->stream_name != NULL) {
+                    //    janus_mutex_lock(&streams_mutex);
+                    //    janus_pubsub_stream *stream = g_hash_table_lookup(streams, session->stream_name);
+                    //    janus_mutex_lock(&stream->subscribers_mutex);
+                    //    if (session->handle == stream->publisher->handle) {
+                    //            /* TODO: Notify subscribers someplace (if not here) and remove the stream record */
+                    //           stream->publisher->handle = NULL;
+                    //           //g_hash_table_remove(streams, stream->name);
+                    //    } else {
+                    //           g_hash_table_remove(stream->subscribers, session->handle);
+                    //    }
+                    //    janus_mutex_unlock(&stream->subscribers_mutex);
+                    //    janus_mutex_unlock(&streams_mutex);
+                    //}
                     JANUS_LOG(LOG_VERB, "Freeing old PubSub session\n");
                     GList *rm = sl->next;
                     old_sessions = g_list_delete_link(old_sessions, sl);
@@ -178,13 +197,32 @@ static void *janus_pubsub_watchdog(void *data) {
                 sl = sl->next;
             }
         }
-        /* TODO Teardown streams too */
+        /* TODO Handle stream cleanup */
         janus_mutex_unlock(&sessions_mutex);
         g_usleep(500000);
     }
     JANUS_LOG(LOG_INFO, "PubSub watchdog stopped\n");
     return NULL;
 }
+
+/* Helper to free janus_pubsub structs. */
+static void janus_stream_free(janus_pubsub_stream *stream) {
+	if(stream) {
+		//janus_mutex_lock(&stream->subscribers_mutex);
+		g_free(stream->name);
+		g_free(stream->sdp_type);
+		g_free(stream->sdp);
+
+		//g_hash_table_unref(room->participants);
+		//g_hash_table_unref(room->private_ids);
+		//g_hash_table_destroy(room->allowed);
+		//janus_mutex_unlock(&room->participants_mutex);
+		//janus_mutex_destroy(&room->participants_mutex);
+		//g_free(room);
+		stream = NULL;
+	}
+}
+
 
 
 int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
@@ -211,6 +249,7 @@ int janus_pubsub_init(janus_callbacks *callback, const char *config_path) {
     config = NULL;
     gateway = callback;
     streams = g_hash_table_new(g_str_hash, g_str_equal);
+    janus_mutex_init(&streams_mutex);
     sessions = g_hash_table_new(NULL, NULL);
     janus_mutex_init(&sessions_mutex);
     g_atomic_int_set(&initialized, 1);
@@ -251,12 +290,15 @@ void janus_pubsub_destroy(void) {
         g_thread_join(watchdog);
         watchdog = NULL;
     }
-    /* FIXME Destroy the sessions cleanly */
+
+    janus_mutex_lock(&streams_mutex);
+    g_hash_table_destroy(streams);
+    janus_mutex_unlock(&streams_mutex);
+
     janus_mutex_lock(&sessions_mutex);
-    // TODO
-    // g_hash_table_destroy(streams);
     g_hash_table_destroy(sessions);
     janus_mutex_unlock(&sessions_mutex);
+
     sessions = NULL;
     g_atomic_int_set(&initialized, 0);
     g_atomic_int_set(&stopping, 0);
@@ -347,6 +389,22 @@ void janus_pubsub_destroy_session(janus_plugin_session *handle, int *error) {
     JANUS_LOG(LOG_VERB, "Removing PubSub session...\n");
     janus_mutex_lock(&sessions_mutex);
     if(!session->destroyed) {
+
+        janus_mutex_lock(&streams_mutex);
+        janus_pubsub_stream *stream = g_hash_table_lookup(streams, session->stream_name);
+        janus_mutex_unlock(&streams_mutex);
+        if (session->handle == stream->publisher->handle) {
+            janus_mutex_lock(&streams_mutex);
+            stream->destroyed = janus_get_monotonic_time();
+            g_hash_table_remove(streams, session->stream_name);
+            janus_mutex_unlock(&streams_mutex);
+            old_streams = g_list_append(old_streams, stream);
+        } else {
+            janus_mutex_lock(&stream->subscribers_mutex);
+            g_hash_table_remove(stream->subscribers, session->handle);
+            janus_mutex_unlock(&stream->subscribers_mutex);
+
+        }
         session->destroyed = janus_get_monotonic_time();
         g_hash_table_remove(sessions, handle);
         /* Cleaning up and removing the session is done in a lazy way */
@@ -418,7 +476,11 @@ void janus_pubsub_incoming_rtp(janus_plugin_session *handle, int video, char *bu
         if(session->destroyed)
             return;
 
+        janus_mutex_lock(&streams_mutex);
         janus_pubsub_stream *stream = g_hash_table_lookup(streams, session->stream_name);
+        janus_mutex_unlock(&streams_mutex);
+        //janus_mutex_lock(&stream->subscribers_mutex);
+
         int count = 0;
         GHashTableIter iter;
         gpointer value;
@@ -427,16 +489,11 @@ void janus_pubsub_incoming_rtp(janus_plugin_session *handle, int video, char *bu
             janus_pubsub_session *p = value;
             gateway->relay_rtp(p->handle, video, buf, len);
         }
-        //if((!video && session->audio_active) || (video && session->video_active)) {
-        //    /* Save the frame if we're recording */
-        //    janus_recorder_save_frame(video ? session->vrc : session->arc, buf, len);
-        //    /* Send the frame back */
-        //    gateway->relay_rtp(handle, video, buf, len);
-        //}
     }
     JANUS_LOG(LOG_VERB, "OUT - Got an RTP message (%d bytes.)\n", len);
+end:
+   return;
 }
-
 
 void janus_pubsub_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len) {
     if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
@@ -454,7 +511,12 @@ void janus_pubsub_incoming_rtcp(janus_plugin_session *handle, int video, char *b
             JANUS_LOG(LOG_ERR, "RTCP with no stream...\n");
             return;
         }
+        //        gateway->relay_rtcp(p->handle, video, buf, len);
+        janus_mutex_lock(&streams_mutex);
         janus_pubsub_stream *stream = g_hash_table_lookup(streams, session->stream_name);
+        janus_mutex_unlock(&streams_mutex);
+
+        //janus_mutex_lock(&stream->subscribers_mutex);
         guint32 bitrate = janus_rtcp_get_remb(buf, len);
         if (session->handle == stream->publisher->handle) {
             int count = 0;
@@ -464,7 +526,10 @@ void janus_pubsub_incoming_rtcp(janus_plugin_session *handle, int video, char *b
             while (!session->destroyed && g_hash_table_iter_next(&iter, NULL, &value)) {
                 janus_pubsub_session *p = value;
                 if(bitrate > 0) {
-                    /* If a REMB arrived, make sure we cap it to our configuration, and send it as a video RTCP */
+                    /*
+                     * If a REMB arrived, make sure we cap it to our configuration, and send it as
+                     * a video RTCP
+                     */
                     if(session->bitrate > 0)
                         janus_rtcp_cap_remb(buf, len, session->bitrate);
                     gateway->relay_rtcp(p->handle, 1, buf, len);
@@ -474,7 +539,9 @@ void janus_pubsub_incoming_rtcp(janus_plugin_session *handle, int video, char *b
             }
         } else {
             if(bitrate > 0) {
-                /* If a REMB arrived, make sure we cap it to our configuration, and send it as a video RTCP */
+                /* If a REMB arrived, make sure we cap it to our configuration, and send it as a
+                 * video RTCP
+                 */
                 if(session->bitrate > 0)
                     janus_rtcp_cap_remb(buf, len, session->bitrate);
                 gateway->relay_rtcp(stream->publisher->handle, 1, buf, len);
@@ -482,8 +549,11 @@ void janus_pubsub_incoming_rtcp(janus_plugin_session *handle, int video, char *b
             }
             gateway->relay_rtcp(stream->publisher->handle, video, buf, len);
         }
+        //janus_mutex_unlock(&stream->subscribers_mutex);
     }
     JANUS_LOG(LOG_VERB, "OUT - Got an RTCP message (%d bytes.)\n", len);
+end:
+   return;
 }
 
 
@@ -605,7 +675,6 @@ static void *janus_pubsub_handler(void *data) {
         janus_pubsub_stream *stream = NULL;
         if(!strcasecmp(request_text, "publish")) {
             json_t *name = json_object_get(root, "name");
-            char *fook = malloc(2048);
             const char *publish_name = json_string_value(name);
 
             struct curl_slist *headers = NULL;
@@ -632,7 +701,11 @@ static void *janus_pubsub_handler(void *data) {
                 stream->sdp = NULL;
                 stream->sdp_type = NULL;
                 session->stream_name = g_strdup(stream->name);
+                janus_mutex_init(&stream->subscribers_mutex);
+
+                janus_mutex_lock(&streams_mutex);
                 g_hash_table_insert(streams, g_strdup(publish_name), stream);
+                janus_mutex_unlock(&streams_mutex);
                 JANUS_LOG(LOG_WARN, "CURL RESP OK (%s)\n", stream->name);
             }
             curl_easy_cleanup(curl);
@@ -665,7 +738,9 @@ static void *janus_pubsub_handler(void *data) {
                 json_object_set_new(event_x, "result", json_string("ok"));
                 stream = g_hash_table_lookup(streams, play_name);
                 if (stream != NULL) {
+                    janus_mutex_lock(&stream->subscribers_mutex);
                     g_hash_table_insert(stream->subscribers, session->handle, session);
+                    janus_mutex_unlock(&stream->subscribers_mutex);
                     session->stream_name = g_strdup(stream->name);
                     json_t *jsep_x = json_pack("{ssss}", "type", stream->sdp_type, "sdp", stream->sdp);
                     int res = gateway->push_event(msg->handle, &janus_pubsub_plugin, msg->transaction, event_x, jsep_x);
@@ -678,9 +753,6 @@ static void *janus_pubsub_handler(void *data) {
             }
             curl_easy_cleanup(curl);
             free(post_data);
-        }
-        if(!strcasecmp(request_text, "play")) {
-            continue;
         }
 
         /* Enforce request */
@@ -742,12 +814,12 @@ static void *janus_pubsub_handler(void *data) {
                 char *answer_sdp = janus_sdp_write(answer);
                 offer = janus_sdp_generate_offer(answer->s_name, answer->c_addr,
                     JANUS_SDP_OA_AUDIO, TRUE,
-                    //JANUS_SDP_OA_AUDIO_CODEC, janus_videoroom_audiocodec_name(videoroom->acodec),
-                    //JANUS_SDP_OA_AUDIO_PT, janus_videoroom_audiocodec_pt(videoroom->acodec),
+                    //JANUS_SDP_OA_AUDIO_CODEC, janus_pubsub_audiocodec_name(videoroom->acodec),
+                    //JANUS_SDP_OA_AUDIO_PT, janus_pubsub_audiocodec_pt(videoroom->acodec),
                     JANUS_SDP_OA_AUDIO_DIRECTION, JANUS_SDP_SENDONLY,
                     JANUS_SDP_OA_VIDEO, TRUE,
-                    //JANUS_SDP_OA_VIDEO_CODEC, janus_videoroom_videocodec_name(videoroom->vcodec),
-                    //JANUS_SDP_OA_VIDEO_PT, janus_videoroom_videocodec_pt(videoroom->vcodec),
+                    //JANUS_SDP_OA_VIDEO_CODEC, janus_pubsub_videocodec_name(videoroom->vcodec),
+                    //JANUS_SDP_OA_VIDEO_PT, janus_pubsub_videocodec_pt(videoroom->vcodec),
                     JANUS_SDP_OA_VIDEO_DIRECTION, JANUS_SDP_SENDONLY,
                     JANUS_SDP_OA_DATA, TRUE,
                     JANUS_SDP_OA_DONE);
