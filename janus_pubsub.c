@@ -604,9 +604,9 @@ error:
         json_object_set_new(event, "error", json_string(error_cause));
         response = event;
         if(root != NULL)
-        	json_decref(root);
+              json_decref(root);
         if(jsep != NULL)
-        	json_decref(jsep);
+              json_decref(jsep);
         g_free(transaction);
         return janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, response);
     }
@@ -925,31 +925,31 @@ static void *janus_pubsub_handler(void *data) {
                         subscriber->subscriber_session = session;
                     } else {
                         /* must be forward */
-		        json_t *j_host = json_object_get(root, "host");
-		        if(j_host) {
+                    json_t *j_host = json_object_get(root, "host");
+                    if(j_host) {
                             subscriber->host = g_strdup(json_string_value(j_host));
                         }
                         else {
                             subscriber->host = g_strdup(PUBSUB_DEFAULT_FWD_HOST);
                         }
-                        
+
                         subscriber->audio_port = 0;
                         subscriber->video_port = 0;
                         subscriber->data_port = 0;
                         guint32 audio_handle;
                         guint32 video_handle;
                         guint32 data_handle;
-		        json_t *j_port = NULL;
+                        json_t *j_port = NULL;
                         j_port = json_object_get(root, "audio_port");
-		        if(j_port) {
+                    if(j_port) {
                             subscriber->audio_port = json_integer_value(j_port);
                         }
                         j_port = json_object_get(root, "video_port");
-		        if(j_port) {
+                    if(j_port) {
                             subscriber->video_port = json_integer_value(j_port);
                         }
                         j_port = json_object_get(root, "data_port");
-		        if(j_port) {
+                    if(j_port) {
                             subscriber->data_port = json_integer_value(j_port);
                         }
 
@@ -1004,38 +1004,7 @@ static void *janus_pubsub_handler(void *data) {
         }
         session->video_active = TRUE;
 
-// TODO
-//        /* Enforce request */
-//        if(audio) {
-//            //session->audio_active = json_is_true(audio);
-//            session->audio_active = json_is_true(audio);
-//            JANUS_LOG(LOG_VERB, "Setting audio property: %s\n", session->audio_active ? "true" : "false");
-//        }
-//        if(video) {
-//            if(!session->video_active && json_is_true(video)) {
-//                /* Send a PLI */
-//                JANUS_LOG(LOG_VERB, "Just (re-)enabled video, sending a PLI to recover it\n");
-//                char buf[12];
-//                memset(buf, 0, 12);
-//                janus_rtcp_pli((char *)&buf, 12);
-//                gateway->relay_rtcp(session->handle, 1, buf, 12);
-//            }
-//            session->video_active = json_is_true(video);
-//            JANUS_LOG(LOG_VERB, "Setting video property: %s\n", session->video_active ? "true" : "false");
-//        }
-//        if(bitrate) {
-//            session->bitrate = json_integer_value(bitrate);
-//            JANUS_LOG(LOG_VERB, "Setting video bitrate: %"SCNu32"\n", session->bitrate);
-//            if(session->bitrate > 0) {
-//                /* FIXME Generate a new REMB (especially useful for Firefox, which doesn't send any we can cap later) */
-//                char buf[24];
-//                memset(buf, 0, 24);
-//                janus_rtcp_remb((char *)&buf, 24, session->bitrate);
-//                JANUS_LOG(LOG_VERB, "Sending REMB\n");
-//                gateway->relay_rtcp(session->handle, 1, buf, 24);
-//                /* FIXME How should we handle a subsequent "no limit" bitrate? */
-//            }
-//        }
+        /* TODO: Enforce request (see echotest plugin) */
 
         /* Any SDP to handle? */
         if(msg_sdp) {
