@@ -150,7 +150,8 @@ static janus_pubsub_message exit_message;
 
 typedef struct janus_pubsub_session {
     janus_plugin_session *handle;
-    gchar *stream_name;
+    gchar *stream_name;                /* session publishes to this stream */
+    guint64 sub_id;                    /* subscriber id */
     gboolean has_audio;
     gboolean has_video;
     gboolean has_data;
@@ -238,7 +239,7 @@ static void *janus_pubsub_watchdog(void *data) {
     gint64 now = 0;
     while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
         janus_mutex_lock(&sessions_mutex);
-        /* Iterate on all the sessions */
+        /* Iterate on all the dead sessions */
         now = janus_get_monotonic_time();
         if(old_sessions != NULL) {
             GList *sl = old_sessions;
@@ -249,7 +250,7 @@ static void *janus_pubsub_watchdog(void *data) {
                     sl = sl->next;
                     continue;
                 }
-                if(now-session->destroyed >= 5*G_USEC_PER_SEC) {
+                if(now - session->destroyed >= 5*G_USEC_PER_SEC) {
                     /* We're lazy and actually get rid of the stuff only after a few seconds */
                     JANUS_LOG(LOG_VERB, "Freeing old PubSub session\n");
                     GList *rm = sl->next;
@@ -263,8 +264,36 @@ static void *janus_pubsub_watchdog(void *data) {
                 sl = sl->next;
             }
         }
-        /* TODO Handle stream cleanup */
         janus_mutex_unlock(&sessions_mutex);
+        janus_mutex_lock(&streams_mutex);
+        /* Iterate on all the dead streams */
+        now = janus_get_monotonic_time();
+        if(old_streams != NULL) {
+            GList *sl = old_streams;
+            JANUS_LOG(LOG_HUGE, "Checking %d old PubSub streams...\n", g_list_length(old_streams));
+            while(sl) {
+                janus_pubsub_stream *stream = (janus_pubsub_stream *)sl->data;
+                if(!stream) {
+                    sl = sl->next;
+                    continue;
+                }
+                if(now - stream->destroyed >= 5*G_USEC_PER_SEC) {
+                    /* We're lazy and actually get rid of the stuff only after a few seconds */
+                    JANUS_LOG(LOG_VERB, "Freeing old PubSub stream\n");
+                    GList *rm = sl->next;
+                    old_streams = g_list_delete_link(old_streams, sl);
+                    sl = rm;
+                    if (stream->udp_sock > 0) {
+                        close(stream->udp_sock);
+                    }
+                    g_free(stream);
+                    stream = NULL;
+                    continue;
+                }
+                sl = sl->next;
+            }
+        }
+        janus_mutex_unlock(&streams_mutex);
         g_usleep(500000);
     }
     JANUS_LOG(LOG_INFO, "PubSub watchdog stopped\n");
@@ -470,6 +499,7 @@ void janus_pubsub_create_session(janus_plugin_session *handle, int *error) {
     session->audio_active = TRUE;
     session->video_active = TRUE;
     session->stream_name = NULL;
+    session->sub_id = 0;
     janus_mutex_init(&session->rec_mutex);
     session->bitrate = 0;    /* No limit */
     session->destroyed = 0;
@@ -508,7 +538,7 @@ void janus_pubsub_destroy_session(janus_plugin_session *handle, int *error) {
             old_streams = g_list_append(old_streams, stream);
         } else {
             janus_mutex_lock(&stream->subscribers_mutex);
-            g_hash_table_remove(stream->subscribers, session->handle);
+            g_hash_table_remove(stream->subscribers, session->sub_id);
             janus_mutex_unlock(&stream->subscribers_mutex);
 
         }
@@ -978,6 +1008,7 @@ static void *janus_pubsub_handler(void *data) {
                                 subscriber, subscriber->host, subscriber->data_port, 0, 0, FALSE, TRUE);
                         }
                     }
+                    session->sub_id  = subscriber_id;
                     janus_mutex_lock(&stream->subscribers_mutex);
                     g_hash_table_insert(stream->subscribers, subscriber_id, subscriber);
                     janus_mutex_unlock(&stream->subscribers_mutex);
