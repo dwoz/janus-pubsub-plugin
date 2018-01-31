@@ -24,6 +24,7 @@
 #define PUBSUB_DEFAULT_PUB_URL "http://localhost:5000/publish"
 #define PUBSUB_DEFAULT_SUB_URL "http://localhost:5000/play"
 #define PUBSUB_DEFAULT_FWD_HOST "127.0.0.1"
+#define PUBSUB_DEFAULT_PULL_HOST "127.0.0.1"
 
 
 /* Error codes */
@@ -174,13 +175,27 @@ typedef struct jansus_pubsub_stream {
     int kind;                          /* Type of publisher */
     gchar *sdp;                        /* The SDP this publisher negotiated, if any */
     gchar *sdp_type;
+    int video_port;
+    int audio_port;
+    int data_port;
+    char *host;
+    int fwd_sock;                      /* The udp socket on which to forward rtp packets */
     janus_pubsub_session *publisher;
     janus_mutex subscribers_mutex;
     GHashTable *subscribers;
-    int udp_sock;                     /* The udp socket on which to forward rtp packets */
+    GHashTable *rtp_pullers;
+    janus_mutex rtp_pullers_mutex;
     gint64 destroyed;                  /* Time at which this stream was marked as destroyed */
 } janus_pubsub_stream;
 
+typedef struct janus_pubsub_puller {
+    gboolean is_video;
+    gboolean is_data;
+    int pull_sock;                      /* The udp socket to stream rtp packets from */
+    uint32_t ssrc;
+    int payload_type;
+    struct sockaddr_in serv_addr;
+} janus_pubsub_puller;
 
 typedef struct janus_pubsub_subscriber {
     guint64 subscriber_id;             /* Unique Subscriber ID */
@@ -239,7 +254,7 @@ static void *janus_pubsub_watchdog(void *data) {
     JANUS_LOG(LOG_INFO, "PubSub watchdog started\n");
     gint64 now = 0;
     while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
-        janus_mutex_lock(&sessions_mutex);
+      //  janus_mutex_lock(&sessions_mutex);
         /* Iterate on all the dead sessions */
         now = janus_get_monotonic_time();
         if(old_sessions != NULL) {
@@ -265,8 +280,8 @@ static void *janus_pubsub_watchdog(void *data) {
                 sl = sl->next;
             }
         }
-        janus_mutex_unlock(&sessions_mutex);
-        janus_mutex_lock(&streams_mutex);
+      //  janus_mutex_unlock(&sessions_mutex);
+      //  janus_mutex_lock(&streams_mutex);
         /* Iterate on all the dead streams */
         now = janus_get_monotonic_time();
         if(old_streams != NULL) {
@@ -284,8 +299,8 @@ static void *janus_pubsub_watchdog(void *data) {
                     GList *rm = sl->next;
                     old_streams = g_list_delete_link(old_streams, sl);
                     sl = rm;
-                    if (stream->udp_sock > 0) {
-                        close(stream->udp_sock);
+                    if (stream->fwd_sock > 0) {
+                        close(stream->fwd_sock);
                     }
                     g_free(stream);
                     stream = NULL;
@@ -294,7 +309,7 @@ static void *janus_pubsub_watchdog(void *data) {
                 sl = sl->next;
             }
         }
-        janus_mutex_unlock(&streams_mutex);
+      //  janus_mutex_unlock(&streams_mutex);
         g_usleep(500000);
     }
     JANUS_LOG(LOG_INFO, "PubSub watchdog stopped\n");
@@ -476,17 +491,53 @@ static guint32 janus_pubsub_forwarder_add_helper(janus_pubsub_subscriber *p,
     forward->serv_addr.sin_port = htons(port);
 
     janus_mutex_lock(&p->rtp_forwarders_mutex);
-    guint32 stream_id = janus_random_uint32();
-    while(g_hash_table_lookup(p->rtp_forwarders, GUINT_TO_POINTER(stream_id)) != NULL) {
-        stream_id = janus_random_uint32();
+    guint32 fwd_id = janus_random_uint32();
+    while(g_hash_table_lookup(p->rtp_forwarders, GUINT_TO_POINTER(fwd_id)) != NULL) {
+        fwd_id = janus_random_uint32();
     }
 
-    g_hash_table_insert(p->rtp_forwarders, GUINT_TO_POINTER(stream_id), forward);
+    g_hash_table_insert(p->rtp_forwarders, GUINT_TO_POINTER(fwd_id), forward);
     janus_mutex_unlock(&p->rtp_forwarders_mutex);
-        //JANUS_LOG(LOG_WARN, "Added rtp_forward on port %s for stream %d\n", p->name, port);
-    return stream_id;
+    // JANUS_LOG(LOG_WARN, "Added rtp_forward on port %s for stream %d\n", p->name, port);
+    return fwd_id;
 }
 
+static guint32 janus_pubsub_puller_add_helper(janus_pubsub_stream *p,
+        const gchar* host, int port, int pt, uint32_t ssrc, gboolean is_video, gboolean is_data) {
+        JANUS_LOG(LOG_WARN, "puller helper %s %d\n", host, port);
+    if(!p || !host) {
+        return 0;
+    }
+    janus_pubsub_puller *puller = g_malloc0(sizeof(janus_pubsub_puller));
+    puller->is_video = is_video;
+    puller->payload_type = pt;
+    puller->ssrc = ssrc;
+    puller->is_data = is_data;
+    puller->serv_addr.sin_family = AF_INET;
+    inet_pton(AF_INET, host, &(puller->serv_addr.sin_addr));
+    puller->serv_addr.sin_port = htons(port);
+    if(puller->pull_sock <= 0) {
+        puller->pull_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if(puller->pull_sock <= 0) {
+            return 0;
+        }
+    }
+    if (bind(puller->pull_sock, (struct sockaddr *)&puller->serv_addr, sizeof(puller->serv_addr)) < 0) {
+            perror("bind failed");
+            return 0;
+    }
+
+    janus_mutex_lock(&p->rtp_pullers_mutex);
+    guint32 pull_id = janus_random_uint32();
+    while(g_hash_table_lookup(p->rtp_pullers, GUINT_TO_POINTER(pull_id)) != NULL) {
+        pull_id = janus_random_uint32();
+    }
+
+    g_hash_table_insert(p->rtp_pullers, GUINT_TO_POINTER(pull_id), puller);
+    janus_mutex_unlock(&p->rtp_pullers_mutex);
+    // JANUS_LOG(LOG_WARN, "Added rtp_forward on port %s for stream %d\n", p->name, port);
+    return pull_id;
+}
 
 void janus_pubsub_create_session(janus_plugin_session *handle, int *error) {
     if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
@@ -705,7 +756,7 @@ void janus_pubsub_incoming_rtp(janus_plugin_session *handle, int video, char *bu
                 GHashTableIter fwd_iter;
                 gpointer fwd_value;
                 g_hash_table_iter_init(&iter, sp->rtp_forwarders);
-                while(stream->udp_sock > 0 && g_hash_table_iter_next(&fwd_iter, NULL, &fwd_value)) {
+                while(stream->fwd_sock > 0 && g_hash_table_iter_next(&fwd_iter, NULL, &fwd_value)) {
                     janus_pubsub_forwarder* rtp_forward = (janus_pubsub_forwarder*)value;
                     /* Check if payload type and/or SSRC need to be overwritten for this forwarder */
                     int pt = rtp->type;
@@ -715,13 +766,13 @@ void janus_pubsub_incoming_rtp(janus_plugin_session *handle, int video, char *bu
                     //if(rtp_forward->ssrc > 0)
                     //    rtp->ssrc = htonl(rtp_forward->ssrc);
                     if(video && rtp_forward->is_video) {
-                       if(sendto(stream->udp_sock, buf, len, 0, (struct sockaddr*)&rtp_forward->serv_addr, sizeof(rtp_forward->serv_addr)) < 0) {
+                       if(sendto(stream->fwd_sock, buf, len, 0, (struct sockaddr*)&rtp_forward->serv_addr, sizeof(rtp_forward->serv_addr)) < 0) {
                            JANUS_LOG(LOG_HUGE, "Error forwarding RTP video packet for %s... %s (len=%d)...\n",
                            stream->name, strerror(errno), len);
                        }
                     }
                     else if(!video && !rtp_forward->is_video && !rtp_forward->is_data) {
-                        if(sendto(stream->udp_sock, buf, len, 0, (struct sockaddr*)&rtp_forward->serv_addr, sizeof(rtp_forward->serv_addr)) < 0) {
+                        if(sendto(stream->fwd_sock, buf, len, 0, (struct sockaddr*)&rtp_forward->serv_addr, sizeof(rtp_forward->serv_addr)) < 0) {
                             JANUS_LOG(LOG_HUGE, "Error forwarding RTP audio packet for %s... %s (len=%d)...\n",
                                  stream->name, strerror(errno), len);
                         }
@@ -837,7 +888,7 @@ void janus_pubsub_hangup_media(janus_plugin_session *handle) {
 static void *janus_pubsub_handler(void *data) {
     JANUS_LOG(LOG_VERB, "Joining PubSub handler thread\n");
     janus_pubsub_message *msg = NULL;
-    int error_code = 0;
+    int error_code, kind = 0;
     char *error_cause = g_malloc0(512);
     json_t *root = NULL;
     while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
@@ -914,13 +965,76 @@ static void *janus_pubsub_handler(void *data) {
                 error_code = JANUS_PUBSUB_ERROR_UNKNOWN_ERROR;
                 goto error;
             } else {
+
+                kind = JANUS_PUBTYP_SESSION;
+                json_t *jkind = json_object_get(root, "kind");
+                if (jkind && !strcasecmp(json_string_value(jkind), "session")) {
+                    kind = JANUS_SUBTYP_SESSION;
+                }
+                else if (jkind && !strcasecmp(json_string_value(jkind), "forward")) {
+                    JANUS_VALIDATE_JSON_OBJECT(root, forward_parameters,
+                            error_code, error_cause, TRUE,
+                            JANUS_PUBSUB_ERROR_MISSING_ELEMENT, JANUS_PUBSUB_ERROR_INVALID_ELEMENT);
+                    if(error_code != 0) {
+                        goto error;
+                    }
+                    kind = JANUS_SUBTYP_FORWARD;
+                }
                 stream = g_malloc0(sizeof(janus_pubsub_stream));
                 stream->name = g_strdup(publish_name);
-                stream->kind = 0;
+                stream->kind = kind;
                 stream->sdp = NULL;
                 stream->sdp_type = NULL;
-                stream->publisher = session;
-                stream->udp_sock = 0;
+                stream->rtp_pullers = g_hash_table_new(NULL, NULL);
+                janus_mutex_init(&stream->rtp_pullers_mutex);
+                if (stream->kind == JANUS_SUBTYP_SESSION) {
+                    stream->publisher = session;
+                    stream->fwd_sock = 0;
+                    stream->video_port = 0;
+                    stream->audio_port = 0;
+                    stream->data_port = 0;
+                    stream->host = NULL;
+                }
+                else {
+                    json_t *j_host = json_object_get(root, "host");
+                    if(j_host) {
+                        stream->host = g_strdup(json_string_value(j_host));
+                    }
+                    else {
+                        stream->host = g_strdup(PUBSUB_DEFAULT_PULL_HOST);
+                    }
+                    json_t *j_port = NULL;
+                    j_port = json_object_get(root, "audio_port");
+                    if(j_port) {
+                        stream->audio_port = json_integer_value(j_port);
+                    }
+                    j_port = json_object_get(root, "video_port");
+                    if(j_port) {
+                        stream->video_port = json_integer_value(j_port);
+                    }
+                    j_port = json_object_get(root, "data_port");
+                    if(j_port) {
+                        stream->data_port = json_integer_value(j_port);
+                    }
+                    guint32 audio_handle;
+                    guint32 video_handle;
+                    guint32 data_handle;
+                    /*
+                     * TODO: video and audio payload_type and ssrc for the forwarder helper calls
+                     */
+                    if(stream->audio_port > 0) {
+                        audio_handle = janus_pubsub_puller_add_helper(
+                            stream, stream->host, stream->audio_port, 0, 0, FALSE, FALSE);
+                    }
+                    if(stream->video_port > 0) {
+                        video_handle = janus_pubsub_puller_add_helper(
+                            stream, stream->host, stream->video_port, 0, 0, TRUE, FALSE);
+                    }
+                    if(stream->data_port > 0) {
+                        data_handle = janus_pubsub_puller_add_helper(
+                            stream, stream->host, stream->data_port, 0, 0, FALSE, TRUE);
+                    }
+                }
                 session->stream_name = g_strdup(stream->name);
                 stream->subscribers = g_hash_table_new(NULL, NULL);
                 janus_mutex_init(&stream->subscribers_mutex);
@@ -942,7 +1056,7 @@ static void *janus_pubsub_handler(void *data) {
             }
             json_t *name = json_object_get(root, "name");
             const char *play_name = json_string_value(name);
-            int kind = JANUS_SUBTYP_SESSION;
+            kind = JANUS_SUBTYP_SESSION;
             json_t *jkind = json_object_get(root, "kind");
             if (jkind && !strcasecmp(json_string_value(jkind), "session")) {
                 kind = JANUS_SUBTYP_SESSION;
@@ -1033,9 +1147,9 @@ static void *janus_pubsub_handler(void *data) {
                         if(j_port) {
                             subscriber->data_port = json_integer_value(j_port);
                         }
-                        if(stream->udp_sock <= 0) {
-                            stream->udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-                            if(stream->udp_sock <= 0) {
+                        if(stream->fwd_sock <= 0) {
+                            stream->fwd_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                            if(stream->fwd_sock <= 0) {
                                 JANUS_LOG(LOG_ERR, "Could not open UDP socket for rtp stream for publisher (%s)\n", stream->name);
                                 error_code = JANUS_PUBSUB_ERROR_UNKNOWN_ERROR;
                                 g_snprintf(error_cause, 512, "Could not open UDP socket for rtp stream");
