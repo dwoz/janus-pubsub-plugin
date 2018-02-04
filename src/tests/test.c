@@ -6,25 +6,41 @@
 
 #include "../common.h"
 
-/* other includes above ^^^ */
 
-#include "dmalloc.h"
+void leak_memory() {
+    int * const temporary = (int*)malloc(sizeof(int));
+    *temporary = 0;
+}
+
 
 /* A test case that does nothing and succeeds. */
-static void null_test_success(void **state) {
+static void test_foo(void **state) {
     (void) state; /* unused */
+    int rv = foo();
+    return;
 }
 
-static void test_test(void **state) {
-    janus_pubsub_puller *p = NULL;
-    int rv = create_puller(p);
-    rv = destroy_puller(p);
-
+static void test_bar(void **state) {
+    int rv = bar();
+    return;
 }
+
+static void test_bam(void **state) {
+    assert_int_equal(bam(), 0);
+    return;
+}
+
+static void test_bat(void **state) {
+    leak_memory();
+    return;
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
-        cmocka_unit_test(null_test_success),
-        cmocka_unit_test(test_test),
+        cmocka_unit_test(test_foo),
+        cmocka_unit_test(test_bar),
+        cmocka_unit_test(test_bam),
+        cmocka_unit_test(test_bat),
     };
     int rv = cmocka_run_group_tests(tests, NULL, NULL);
     return rv;
